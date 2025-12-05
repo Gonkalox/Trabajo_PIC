@@ -6,7 +6,7 @@ from pygame import mixer
 import os
 
 # --- DEBUG CONFIG ---
-DEBUG_MODE = True  # Set to True to see threshold window and Instrument ROIs
+DEBUG_MODE = False  # Set to True to see threshold window and Instrument ROIs
 
 # --- AUDIO INIT ---
 try:
@@ -43,9 +43,9 @@ ACTION_COOLDOWN_TIME = 2.0     # Safety buffer after creating instrument or cali
 
 # Instrument Types
 INSTRUMENT_TYPES = {
-    2: {'name': 'SNARE', 'color': (0, 0, 255), 'radius': 100, 'sound': SOUND_SNARE, 'img_file': 'Tambor_pequeno.png'},
-    3: {'name': 'BASS',  'color': (0, 255, 0), 'radius': 150, 'sound': SOUND_BASS,  'img_file': 'Tambor_Grande.png'},
-    4: {'name': 'CYMBAL','color': (0, 255, 255), 'radius': 100, 'sound': SOUND_CYMBAL,'img_file': 'Platillos.png'}
+    2: {'name': 'SNARE', 'color': (0, 0, 255), 'radius': 80, 'sound': SOUND_SNARE, 'img_file': 'Tambor_pequeno.png'},
+    3: {'name': 'BASS',  'color': (0, 255, 0), 'radius': 100, 'sound': SOUND_BASS,  'img_file': 'Tambor_Grande.png'},
+    4: {'name': 'CYMBAL','color': (0, 255, 255), 'radius': 80, 'sound': SOUND_CYMBAL,'img_file': 'Platillos.png'}
 }
 
 class HandProcessor:
@@ -281,21 +281,34 @@ class InstrumentManager:
     def clear(self):
         self.instruments = []
 
-    def check_collisions(self, stick_pos):
-        if not stick_pos: return
+    def check_collisions(self, stick_positions):
+        """Checks collisions for a list of stick positions."""
+        # Convert single position to list for compatibility if needed, 
+        # but stick_positions should now be a list.
+        if not stick_positions: return
 
-        sx, sy = stick_pos
         for drum in self.instruments:
             dx, dy = drum['pos']
-            dist = math.sqrt((sx - dx)**2 + (sy - dy)**2)
+            hit = False
             
-            if dist < drum['radius']:
-                # User requested NO visual color change, just sound
+            # Check if ANY stick hits this drum
+            for stick_pos in stick_positions:
+                if stick_pos is None: continue
+                
+                sx, sy = stick_pos
+                dist = math.sqrt((sx - dx)**2 + (sy - dy)**2)
+                
+                if dist < drum['radius']:
+                    hit = True
+                    break # One hit is enough to trigger
+            
+            if hit:
+                # Trigger sound only on new press (rising edge)
                 if not drum['is_playing']:
                     if drum['sound']: drum['sound'].play()
                     drum['is_playing'] = True
             else:
-                # Reset playing state but do not change color since we don't draw circles
+                # Reset when no stick is inside
                 drum['is_playing'] = False
 
     def _overlay_image_alpha(self, img, img_overlay, x, y, alpha_mask):
@@ -375,7 +388,11 @@ class DrumApp:
         
         self.state = STATE_WAITING
         self.hand_detector = HandProcessor()
-        self.stick_tracker = StickTracker()
+        
+        # 2 Independent Stick Trackers
+        self.sticks = [StickTracker(), StickTracker()] 
+        self.next_stick_to_calibrate = 0 # 0 for Stick 1, 1 for Stick 2
+
         self.instruments = InstrumentManager()
         
         self.roi = None # (x, y, w, h)
@@ -394,6 +411,9 @@ class DrumApp:
         self.stable_finger_count = 0  
         self.pending_finger_count = 0 
         self.finger_stable_start = None
+        
+        # Debug / Keyboard Simulation
+        self.simulated_fingers = 0
 
         # Calibration specific timer
         self.calibration_timer_start = None
@@ -406,13 +426,16 @@ class DrumApp:
         self.stable_finger_count = 0
         self.pending_finger_count = 0
         self.finger_stable_start = None
+        # FIX: Reset simulated fingers to avoid auto-triggering next state
+        self.simulated_fingers = 0 
 
     def _trigger_action_cooldown(self):
         """Called after a successful create/calibrate to prevent double actions"""
         self.last_action_time = time.time()
         # Reset stick stability to force user to move and stop again
-        self.stick_tracker.is_stable = False
-        self.stick_tracker.stable_start_time = time.time()
+        for s in self.sticks:
+            s.is_stable = False
+            s.stable_start_time = time.time()
 
     def _reset_finger_states(self):
         """Forces the finger state to reset to 0 (No selection)"""
@@ -420,6 +443,8 @@ class DrumApp:
         self.pending_finger_count = 0
         self.finger_stable_start = None
         self.selected_instrument_type = None
+        # FIX: Reset simulated fingers to avoid repeated actions
+        self.simulated_fingers = 0
 
     def _update_finger_stability(self, raw_count):
         # CHANGE: Ignore 0 fingers. If hand is lost, keep the last confirmed state.
@@ -447,35 +472,44 @@ class DrumApp:
         for p in defects:
             cv2.circle(frame, p, 5, (255, 0, 0), -1)
 
-    def _track_stick_in_rois(self, frame):
-        """Optimized stick tracking: searches only within instrument ROIs."""
-        for drum in self.instruments.instruments:
-            # ROI is (x, y, w, h)
-            rx, ry, rw, rh = drum['roi']
-            
-            # Clamp to frame dimensions to avoid errors
-            h_img, w_img = frame.shape[:2]
-            x1 = max(0, rx)
-            y1 = max(0, ry)
-            x2 = min(w_img, rx + rw)
-            y2 = min(h_img, ry + rh)
-            
-            if x2 <= x1 or y2 <= y1:
-                continue
+    def _track_sticks_in_rois(self, frame):
+        """
+        Optimized stick tracking for MULTIPLE sticks.
+        Returns a list of positions: [pos_stick_1, pos_stick_2]
+        """
+        stick_positions = [None, None]
 
-            roi_frame = frame[y1:y2, x1:x2]
+        # For each stick tracker
+        for i, stick_tracker in enumerate(self.sticks):
+            # Check all instrument ROIs to find this stick
+            # Note: A stick can only be in one place, so if found in one ROI, 
+            # we can technically stop searching for THAT stick in other ROIs to save time.
+            # But overlapping ROIs might make this tricky. Let's do simple search first.
             
-            # Find stick in this ROI
-            # Note: find_stick updates internal stability state with local coords. 
-            # This is acceptable as stability isn't used in PLAYING state.
-            local_pos = self.stick_tracker.find_stick(roi_frame)
-            
-            if local_pos:
-                # Convert back to global coordinates
-                global_pos = (local_pos[0] + x1, local_pos[1] + y1)
-                return global_pos
+            for drum in self.instruments.instruments:
+                rx, ry, rw, rh = drum['roi']
+                
+                # Clamp to frame
+                h_img, w_img = frame.shape[:2]
+                x1 = max(0, rx)
+                y1 = max(0, ry)
+                x2 = min(w_img, rx + rw)
+                y2 = min(h_img, ry + rh)
+                
+                if x2 <= x1 or y2 <= y1:
+                    continue
+
+                roi_frame = frame[y1:y2, x1:x2]
+                
+                local_pos = stick_tracker.find_stick(roi_frame)
+                
+                if local_pos:
+                    # Convert to global
+                    global_pos = (local_pos[0] + x1, local_pos[1] + y1)
+                    stick_positions[i] = global_pos
+                    break # Found this stick, stop checking other ROIs for this stick
         
-        return None
+        return stick_positions
 
     def run(self):
         while True:
@@ -484,37 +518,71 @@ class DrumApp:
             frame = cv2.flip(frame, 1)
             display_frame = frame.copy()
             
+            # KEYBOARD INPUT HANDLING
+            key = cv2.waitKey(1) & 0xFF
+            if key == 27: break # ESC to exit
+
+            # Keyboard Debug: Simulate Fingers
+            if key in [ord(str(i)) for i in range(6)]: # Keys 0-5
+                self.simulated_fingers = int(chr(key))
+                print(f"DEBUG: Simulated Fingers set to {self.simulated_fingers}")
+
+            # Keyboard Debug: Force State
+            if key == ord('w'):
+                self._change_state(STATE_WAITING)
+                print("DEBUG: Forced state WAITING")
+            elif key == ord('c'):
+                if self.roi is None:
+                    h, w = frame.shape[:2]
+                    self.roi = (int(w*0.25), int(h*0.25), int(w*0.5), int(h*0.5))
+                self._change_state(STATE_CONFIG)
+                print("DEBUG: Forced state CONFIG")
+            elif key == ord('p'):
+                self._change_state(STATE_PLAYING)
+                print("DEBUG: Forced state PLAYING")
+
             # 1. Global Processing
-            # Hand (needed globally for reset gesture)
-            f_count, f_cont, f_hull, f_defects, thresh_full = self.hand_detector.process(frame)
+            if DEBUG_MODE:
+                f_count = self.simulated_fingers
+                f_cont, f_hull, f_defects = None, None, []
+                thresh_full = None
+            else:
+                f_count, f_cont, f_hull, f_defects, thresh_full = self.hand_detector.process(frame)
             
-            # DEBUG MODE VISUALS
+            effective_fingers_global = f_count
+            
             if DEBUG_MODE and thresh_full is not None:
                 cv2.imshow("Debug - Hand Threshold", thresh_full)
             
             # Stick Tracking Strategy
-            stick_pos_global = None
+            stick_positions_global = [None, None]
+            
             if self.state == STATE_PLAYING:
                  # Optimization: Only track inside Instrument ROIs
-                 stick_pos_global = self._track_stick_in_rois(frame)
+                 stick_positions_global = self._track_sticks_in_rois(frame)
             else:
                  # Full screen tracking for Setup/Config
-                 stick_pos_global = self.stick_tracker.find_stick(frame)
+                 stick_positions_global[0] = self.sticks[0].find_stick(frame)
+                 stick_positions_global[1] = self.sticks[1].find_stick(frame)
             
-            # Draw Stick Pointer (Only if detected)
-            if stick_pos_global:
-                cv2.circle(display_frame, stick_pos_global, 10, (0, 255, 255), 2) # Yellow Ring
-                cv2.circle(display_frame, stick_pos_global, 3, (0, 0, 0), -1)     # Black dot
+            # Draw Stick Pointers
+            colors = [(0, 255, 255), (255, 0, 255)] # Stick 1: Yellow/Cyan, Stick 2: Magenta
+            for i, pos in enumerate(stick_positions_global):
+                if pos:
+                    cv2.circle(display_frame, pos, 10, colors[i], 2)
+                    cv2.circle(display_frame, pos, 3, (0, 0, 0), -1)
+                    cv2.putText(display_frame, f"S{i+1}", (pos[0]+10, pos[1]-10), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, colors[i], 1)
 
             # --- STATE MACHINE ---
             if self.state == STATE_WAITING:
-                self._handle_waiting(display_frame, f_count, f_cont, f_hull, f_defects)
+                self._handle_waiting(display_frame, effective_fingers_global, f_cont, f_hull, f_defects)
             
             elif self.state == STATE_CONFIG:
-                self._handle_config(frame, display_frame, stick_pos_global)
+                self._handle_config(frame, display_frame, stick_positions_global, override_fingers=self.simulated_fingers)
 
             elif self.state == STATE_PLAYING:
-                self._handle_playing(frame, display_frame, f_count, stick_pos_global)
+                self._handle_playing(frame, display_frame, effective_fingers_global, stick_positions_global)
 
             # Draw Instruments
             self.instruments.draw(display_frame)
@@ -524,13 +592,18 @@ class DrumApp:
             
             # Messages
             if time.time() - self.show_calib_success_msg < 2.0:
-                 cv2.putText(display_frame, "COLOR CALIBRATED!", (300, 300), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 4)
+                 # Show which stick was calibrated
+                 calibrated_stick_id = 1 if self.next_stick_to_calibrate == 0 else 2 # The one just finished is prev
+                 cv2.putText(display_frame, f"STICK {calibrated_stick_id} CALIBRATED!", (300, 300), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 3)
 
             cv2.putText(display_frame, f"STATE: {state_text}", (10, 30), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            
+            if self.simulated_fingers > 0 or DEBUG_MODE:
+                cv2.putText(display_frame, f"DEBUG FINGERS: {self.simulated_fingers}", (10, 60), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
             cv2.imshow("Virtual Drums", display_frame)
-            if cv2.waitKey(1) & 0xFF == 27: break 
 
         self.cap.release()
         cv2.destroyAllWindows()
@@ -538,7 +611,6 @@ class DrumApp:
     def _handle_waiting(self, display, fingers, contour, hull, defects):
         self._draw_hand_debug(display, contour, hull, defects)
         
-        # Cooldown check for State Change
         if time.time() - self.last_state_change_time < STATE_COOLDOWN_TIME:
             return
 
@@ -551,31 +623,42 @@ class DrumApp:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
             
             if elapsed >= TIME_TO_LOCK_ROI:
-                x, y, w, h = cv2.boundingRect(contour)
-                x = max(0, x - self.roi_padding)
-                y = max(0, y - self.roi_padding)
-                w = min(display.shape[1] - x, w + 2*self.roi_padding)
-                h = min(display.shape[0] - y, h + 2*self.roi_padding)
+                if contour is not None:
+                    x, y, w, h = cv2.boundingRect(contour)
+                    x = max(0, x - self.roi_padding)
+                    y = max(0, y - self.roi_padding)
+                    w = min(display.shape[1] - x, w + 2*self.roi_padding)
+                    h = min(display.shape[0] - y, h + 2*self.roi_padding)
+                    self.roi = (x, y, w, h)
+                elif DEBUG_MODE:
+                    h, w = display.shape[:2]
+                    self.roi = (int(w*0.25), int(h*0.25), int(w*0.5), int(h*0.5))
                 
-                self.roi = (x, y, w, h)
-                self._change_state(STATE_CONFIG)
-                self.waiting_timer_start = None
-                print(f"State Changed: CONFIG. ROI: {self.roi}")
+                if self.roi is not None:
+                    self._change_state(STATE_CONFIG)
+                    self.waiting_timer_start = None
+                    print(f"State Changed: CONFIG. ROI: {self.roi}")
         else:
             self.waiting_timer_start = None
             cv2.putText(display, "Show 5 Fingers to Start", (10, 70), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
 
-    def _handle_config(self, frame, display, stick_pos):
+    def _handle_config(self, frame, display, stick_positions, override_fingers=0):
+        # NOTE: stick_positions is a list [pos1, pos2]
+        
         rx, ry, rw, rh = self.roi
         cv2.rectangle(display, (rx, ry), (rx+rw, ry+rh), (255, 0, 0), 2)
         
-        # 1. Process Hand in ROI
-        roi_img = frame[ry:ry+rh, rx:rx+rw]
-        f_roi, c_roi, h_roi, d_roi, _ = self.hand_detector.process(roi_img, offset=(rx, ry))
+        if DEBUG_MODE:
+             f_roi = override_fingers
+             c_roi, h_roi, d_roi = None, None, []
+        else:
+             roi_img = frame[ry:ry+rh, rx:rx+rw]
+             f_roi, c_roi, h_roi, d_roi, _ = self.hand_detector.process(roi_img, offset=(rx, ry))
+             if override_fingers > 0:
+                 f_roi = override_fingers
+
         self._draw_hand_debug(display, c_roi, h_roi, d_roi)
-        
-        # 2. Update Finger Stability (With Cooldown visual)
         self._update_finger_stability(f_roi)
         
         if self.finger_stable_start is not None:
@@ -587,11 +670,10 @@ class DrumApp:
         cv2.putText(display, f"Stable: {self.stable_finger_count}", 
                     (rx, ry-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
 
-        # CHECK GLOBAL ACTION COOLDOWN
         if time.time() - self.last_action_time < ACTION_COOLDOWN_TIME:
             wait = ACTION_COOLDOWN_TIME - (time.time() - self.last_action_time)
             cv2.putText(display, f"Action Cooldown: {wait:.1f}s", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-            return # Block any new action (creation, calibration)
+            return
 
         # 3. Logic based on STABLE count
         
@@ -604,8 +686,12 @@ class DrumApp:
             bx2 = bx1 + box_w
             by2 = by1 + box_h
             
-            cv2.rectangle(display, (bx1, by1), (bx2, by2), (0, 255, 255), 2)
-            cv2.putText(display, "Place Stick Here", (bx1-20, by2+20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+            # Identify which stick is being calibrated
+            current_stick_id = self.next_stick_to_calibrate + 1
+            color_text = (0, 255, 255) if current_stick_id == 1 else (255, 0, 255)
+            
+            cv2.rectangle(display, (bx1, by1), (bx2, by2), color_text, 2)
+            cv2.putText(display, f"Place Stick {current_stick_id} Here", (bx1-40, by2+20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_text, 1)
 
             if self.calibration_timer_start is None:
                 self.calibration_timer_start = time.time()
@@ -618,11 +704,17 @@ class DrumApp:
             
             if calib_elapsed >= CALIBRATION_TIME:
                 calib_roi = frame[by1:by2, bx1:bx2]
-                success = self.stick_tracker.calibrate(calib_roi)
+                
+                # Calibrate the specific stick tracker
+                tracker_to_calibrate = self.sticks[self.next_stick_to_calibrate]
+                success = tracker_to_calibrate.calibrate(calib_roi)
+                
                 if success:
                     self.show_calib_success_msg = time.time()
-                    self._trigger_action_cooldown() # Trigger cooldown
-                    self._reset_finger_states()     # CHANGE: Force reset to require new gesture
+                    self._trigger_action_cooldown() 
+                    self._reset_finger_states()
+                    # Toggle stick for next time
+                    self.next_stick_to_calibrate = (self.next_stick_to_calibrate + 1) % 2
                 self.calibration_timer_start = None 
         else:
             self.calibration_timer_start = None 
@@ -632,10 +724,9 @@ class DrumApp:
             self.calibrating_mode = False
             self.selected_instrument_type = self.stable_finger_count
             name = INSTRUMENT_TYPES[self.stable_finger_count]['name']
-            cv2.putText(display, f"Selected: {name} (Hold Stick)", (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+            cv2.putText(display, f"Selected: {name} (Hold Stick 1)", (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
 
         # --- EXIT TO PLAYING (5 Fingers) ---
-        # Cooldown prevents leaving immediately if we just entered
         state_elapsed = time.time() - self.last_state_change_time
         if self.stable_finger_count == 5:
             if state_elapsed >= STATE_COOLDOWN_TIME:
@@ -646,46 +737,50 @@ class DrumApp:
                 wait_time = STATE_COOLDOWN_TIME - state_elapsed
                 cv2.putText(display, f"Exit locked: {wait_time:.1f}s", (rx, ry+rh+20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
-        # 4. Stick Logic (Creation) - Valid if not Calibrating and Action Cooldown passed
+        # 4. Stick Logic (Creation) - ONLY WITH STICK 1
+        stick1_pos = stick_positions[0]
+        stick1_tracker = self.sticks[0]
+
         if self.selected_instrument_type and self.stable_finger_count != 1:
-            if stick_pos:
-                progress = self.stick_tracker.get_stability_progress()
+            if stick1_pos:
+                progress = stick1_tracker.get_stability_progress()
                 radius = INSTRUMENT_TYPES[self.selected_instrument_type]['radius']
                 
-                # Ghost instrument (KEEP THIS for creation feedback)
-                cv2.circle(display, stick_pos, radius, (100, 100, 100), 1)
-                # Filling animation (KEEP THIS for creation feedback)
+                # Ghost instrument
+                cv2.circle(display, stick1_pos, radius, (100, 100, 100), 1)
+                # Filling animation
                 fill_rad = int(radius * progress)
-                cv2.circle(display, stick_pos, fill_rad, (0, 255, 255), -1)
+                cv2.circle(display, stick1_pos, fill_rad, (0, 255, 255), -1)
 
-                if self.stick_tracker.is_stable:
-                    self.instruments.add_instrument(self.selected_instrument_type, stick_pos)
-                    self._trigger_action_cooldown() # Trigger cooldown
-                    self._reset_finger_states()     # CHANGE: Force reset to require new gesture
+                if stick1_tracker.is_stable:
+                    self.instruments.add_instrument(self.selected_instrument_type, stick1_pos)
+                    self._trigger_action_cooldown() 
+                    self._reset_finger_states()     
 
-    def _handle_playing(self, frame, display, fingers_global, stick_pos):
+    def _handle_playing(self, frame, display, fingers_global, stick_positions):
         # 1. Reset Check (Global 5 fingers)
-        # Check cooldown (state lock)
         if time.time() - self.last_state_change_time > STATE_COOLDOWN_TIME:
             if fingers_global == 5:
-                # Re-confirm ROI
-                _, c_global, _, _, _ = self.hand_detector.process(frame)
-                if c_global is not None:
-                    x, y, w, h = cv2.boundingRect(c_global)
-                    x = max(0, x - self.roi_padding)
-                    y = max(0, y - self.roi_padding)
-                    w = min(frame.shape[1] - x, w + 2*self.roi_padding)
-                    h = min(frame.shape[0] - y, h + 2*self.roi_padding)
-                    self.roi = (x, y, w, h)
-                    
-                    self.instruments.clear()
-                    self._change_state(STATE_CONFIG)
-                    print("Reset triggered. Back to CONFIG.")
-                    return
+                if not DEBUG_MODE:
+                    _, c_global, _, _, _ = self.hand_detector.process(frame)
+                    if c_global is not None:
+                        x, y, w, h = cv2.boundingRect(c_global)
+                        x = max(0, x - self.roi_padding)
+                        y = max(0, y - self.roi_padding)
+                        w = min(frame.shape[1] - x, w + 2*self.roi_padding)
+                        h = min(frame.shape[0] - y, h + 2*self.roi_padding)
+                        self.roi = (x, y, w, h)
+                elif self.roi is None:
+                     h, w = frame.shape[:2]
+                     self.roi = (int(w*0.25), int(h*0.25), int(w*0.5), int(h*0.5))
 
-        # 2. Track Stick Collisions
-        if stick_pos:
-            self.instruments.check_collisions(stick_pos)
+                self.instruments.clear()
+                self._change_state(STATE_CONFIG)
+                print("Reset triggered. Back to CONFIG.")
+                return
+
+        # 2. Track Stick Collisions (Multi-stick)
+        self.instruments.check_collisions(stick_positions)
 
 if __name__ == "__main__":
     app = DrumApp()

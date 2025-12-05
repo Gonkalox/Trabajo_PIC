@@ -487,10 +487,6 @@ class DrumApp:
             frame = cv2.flip(frame, 1)
             display_frame = frame.copy()
             
-            # 1. Global Processing
-            # Hand (needed globally for reset gesture)
-            f_count, f_cont, f_hull, f_defects, thresh_full = self.hand_detector.process(frame)
-            
             # KEYBOARD INPUT HANDLING
             # Capture key press
             key = cv2.waitKey(1) & 0xFF
@@ -517,9 +513,20 @@ class DrumApp:
                 self._change_state(STATE_PLAYING)
                 print("DEBUG: Forced state PLAYING")
 
-            # Determine Effective Fingers (Simulated > Real)
-            # If simulated_fingers is 0, we use camera detection
-            effective_fingers_global = self.simulated_fingers if self.simulated_fingers > 0 else f_count
+            # 1. Global Processing
+            if DEBUG_MODE:
+                # Bypass Hand Detection
+                # We use simulated_fingers as the ground truth in debug mode
+                f_count = self.simulated_fingers
+                f_cont, f_hull, f_defects = None, None, []
+                thresh_full = None
+            else:
+                # Real Hand Detection
+                # Hand (needed globally for reset gesture)
+                f_count, f_cont, f_hull, f_defects, thresh_full = self.hand_detector.process(frame)
+            
+            # Determine Effective Fingers (In Debug mode, f_count is already simulated_fingers)
+            effective_fingers_global = f_count
             
             # DEBUG MODE VISUALS
             if DEBUG_MODE and thresh_full is not None:
@@ -564,7 +571,7 @@ class DrumApp:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             
             # Show Debug Finger Status
-            if self.simulated_fingers > 0:
+            if self.simulated_fingers > 0 or DEBUG_MODE:
                 cv2.putText(display_frame, f"DEBUG FINGERS: {self.simulated_fingers}", (10, 60), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
@@ -589,15 +596,24 @@ class DrumApp:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
             
             if elapsed >= TIME_TO_LOCK_ROI:
-                # Safety check: if simulating 5 fingers but no hand, don't crash
+                # If we have a contour (Real Mode), use it. 
+                # If DEBUG_MODE is ON and we simulated 5 fingers, contour is None.
+                # In that case, use default centered ROI.
+                
                 if contour is not None:
                     x, y, w, h = cv2.boundingRect(contour)
                     x = max(0, x - self.roi_padding)
                     y = max(0, y - self.roi_padding)
                     w = min(display.shape[1] - x, w + 2*self.roi_padding)
                     h = min(display.shape[0] - y, h + 2*self.roi_padding)
-                    
                     self.roi = (x, y, w, h)
+                elif DEBUG_MODE:
+                    # Fallback for Debug Mode (Simulated 5 fingers, no hand found)
+                    h, w = display.shape[:2]
+                    self.roi = (int(w*0.25), int(h*0.25), int(w*0.5), int(h*0.5))
+                
+                # Only change state if we successfully got a ROI
+                if self.roi is not None:
                     self._change_state(STATE_CONFIG)
                     self.waiting_timer_start = None
                     print(f"State Changed: CONFIG. ROI: {self.roi}")
@@ -611,14 +627,19 @@ class DrumApp:
         cv2.rectangle(display, (rx, ry), (rx+rw, ry+rh), (255, 0, 0), 2)
         
         # 1. Process Hand in ROI
-        roi_img = frame[ry:ry+rh, rx:rx+rw]
-        f_roi, c_roi, h_roi, d_roi, _ = self.hand_detector.process(roi_img, offset=(rx, ry))
+        # If DEBUG_MODE is ON, skip actual processing and rely on simulated fingers
+        if DEBUG_MODE:
+             f_roi = override_fingers
+             c_roi, h_roi, d_roi = None, None, []
+        else:
+             roi_img = frame[ry:ry+rh, rx:rx+rw]
+             f_roi, c_roi, h_roi, d_roi, _ = self.hand_detector.process(roi_img, offset=(rx, ry))
+             # Apply override if active (for Hybrid testing)
+             if override_fingers > 0:
+                 f_roi = override_fingers
+
         self._draw_hand_debug(display, c_roi, h_roi, d_roi)
         
-        # Apply override if active
-        if override_fingers > 0:
-            f_roi = override_fingers
-
         # 2. Update Finger Stability (With Cooldown visual)
         self._update_finger_stability(f_roi)
         
@@ -713,19 +734,29 @@ class DrumApp:
         if time.time() - self.last_state_change_time > STATE_COOLDOWN_TIME:
             if fingers_global == 5:
                 # Re-confirm ROI
-                _, c_global, _, _, _ = self.hand_detector.process(frame)
-                if c_global is not None:
-                    x, y, w, h = cv2.boundingRect(c_global)
-                    x = max(0, x - self.roi_padding)
-                    y = max(0, y - self.roi_padding)
-                    w = min(frame.shape[1] - x, w + 2*self.roi_padding)
-                    h = min(frame.shape[0] - y, h + 2*self.roi_padding)
-                    self.roi = (x, y, w, h)
-                    
-                    self.instruments.clear()
-                    self._change_state(STATE_CONFIG)
-                    print("Reset triggered. Back to CONFIG.")
-                    return
+                # Only try to detect hand if we are NOT in DEBUG_MODE or if we have a valid contour somehow
+                # But here fingers_global is passed in.
+                # If DEBUG_MODE, we probably don't want to re-run detection just to get ROI.
+                # We can just assume current ROI is fine or re-use default.
+                
+                if not DEBUG_MODE:
+                    _, c_global, _, _, _ = self.hand_detector.process(frame)
+                    if c_global is not None:
+                        x, y, w, h = cv2.boundingRect(c_global)
+                        x = max(0, x - self.roi_padding)
+                        y = max(0, y - self.roi_padding)
+                        w = min(frame.shape[1] - x, w + 2*self.roi_padding)
+                        h = min(frame.shape[0] - y, h + 2*self.roi_padding)
+                        self.roi = (x, y, w, h)
+                elif self.roi is None:
+                     # Fallback if somehow ROI is lost in Debug
+                     h, w = frame.shape[:2]
+                     self.roi = (int(w*0.25), int(h*0.25), int(w*0.5), int(h*0.5))
+
+                self.instruments.clear()
+                self._change_state(STATE_CONFIG)
+                print("Reset triggered. Back to CONFIG.")
+                return
 
         # 2. Track Stick Collisions
         if stick_pos:

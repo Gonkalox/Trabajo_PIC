@@ -1,3 +1,4 @@
+from re import DEBUG
 import cv2
 import numpy as np
 import math
@@ -6,7 +7,8 @@ from pygame import mixer
 import os
 
 # --- DEBUG CONFIG ---
-DEBUG_MODE = False  # Set to True to see threshold window and Instrument ROIs
+DEBUG_MODE = True  # Set to True to use keybord for finger simulation
+PRESENTATION_MODE = False    # Set to true to enable intermidiete processing displays
 
 # --- AUDIO INIT ---
 try:
@@ -69,7 +71,7 @@ class HandProcessor:
         gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
         _, thresh = cv2.threshold(blurred, HAND_THRESHOLD, 255, cv2.THRESH_BINARY_INV)
-        
+
         contours, _ = cv2.findContours(thresh, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
         
         if not contours:
@@ -97,6 +99,14 @@ class HandProcessor:
 
         count = 0
         defects_global = []
+
+        # Prepare debug image for defects
+        if PRESENTATION_MODE:
+            debug_hull_defects = img_bgr.copy()
+            # Draw hull
+            cv2.drawContours(debug_hull_defects, [hull_pts_local], -1, (0, 0, 255), 2)
+            # Draw contour
+            cv2.drawContours(debug_hull_defects, [c], -1, (0, 255, 0), 1)
         
         for i in range(defects.shape[0]):
             s, e, f, d = defects[i, 0]
@@ -110,6 +120,30 @@ class HandProcessor:
                 if angle < 90:
                     count += 1
                     defects_global.append((far[0] + gx, far[1] + gy))
+
+                    # Draw valid defect point in presentation mode
+                    if PRESENTATION_MODE:
+                        cv2.circle(debug_hull_defects, far, 5, (255, 0, 0), -1) # Blue dot for defect
+                        cv2.line(debug_hull_defects, start, end, (0, 255, 255), 1) # Yellow line connecting fingers
+
+                # --- PRESENTATION MODE VISUALIZATION ---
+        if PRESENTATION_MODE:
+            cv2.imshow("Step 1: Grayscale", gray)
+            cv2.imshow("Step 2: Gaussian Blur", blurred)
+            cv2.imshow("Step 3: Binary Threshold", thresh)
+
+            # Draw all contours on a black background
+            debug_all_contours = np.zeros_like(img_bgr)
+            cv2.drawContours(debug_all_contours, contours, -1, (0, 255, 0), 1)
+            cv2.imshow("Step 4: All Contours", debug_all_contours)
+
+            # Draw only the largest contour (the selected hand)
+            debug_hand_contour = np.zeros_like(img_bgr)
+            cv2.drawContours(debug_hand_contour, [c], -1, (0, 255, 255), 2)
+            cv2.imshow("Step 5: Selected Hand Contour", debug_hand_contour)
+
+            cv2.imshow("Step 6: Hull & Defects", debug_hull_defects)
+        # ---------------------------------------
         
         return count + 1, c_global, hull_global, defects_global, thresh
 
@@ -546,13 +580,11 @@ class DrumApp:
                 f_count = self.simulated_fingers
                 f_cont, f_hull, f_defects = None, None, []
                 thresh_full = None
-            else:
+            elif self.state is not STATE_CONFIG:
                 f_count, f_cont, f_hull, f_defects, thresh_full = self.hand_detector.process(frame)
+            else: f_count = None;
             
             effective_fingers_global = f_count
-            
-            if DEBUG_MODE and thresh_full is not None:
-                cv2.imshow("Debug - Hand Threshold", thresh_full)
             
             # Stick Tracking Strategy
             stick_positions_global = [None, None]
@@ -582,7 +614,7 @@ class DrumApp:
                 self._handle_config(frame, display_frame, stick_positions_global, override_fingers=self.simulated_fingers)
 
             elif self.state == STATE_PLAYING:
-                self._handle_playing(frame, display_frame, effective_fingers_global, stick_positions_global)
+                self._handle_playing(frame, display_frame, effective_fingers_global, stick_positions_global, f_cont, f_hull, f_defects)
 
             # Draw Instruments
             self.instruments.draw(display_frame)
@@ -593,7 +625,7 @@ class DrumApp:
             # Messages
             if time.time() - self.show_calib_success_msg < 2.0:
                  # Show which stick was calibrated
-                 calibrated_stick_id = 1 if self.next_stick_to_calibrate == 0 else 2 # The one just finished is prev
+                 calibrated_stick_id = 1 if self.next_stick_to_calibrate == 1 else 2 # The one just finished is prev
                  cv2.putText(display_frame, f"STICK {calibrated_stick_id} CALIBRATED!", (300, 300), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 3)
 
             cv2.putText(display_frame, f"STATE: {state_text}", (10, 30), 
@@ -619,7 +651,9 @@ class DrumApp:
                 self.waiting_timer_start = time.time()
             
             elapsed = time.time() - self.waiting_timer_start
-            cv2.putText(display, f"Hold to Start: {elapsed:.1f}/{TIME_TO_LOCK_ROI}s", (10, 70), 
+            if DEBUG_MODE: y_text = 90 
+            else: y_text = 60
+            cv2.putText(display, f"Hold to Start: {elapsed:.1f}/{TIME_TO_LOCK_ROI}s", (10, y_text), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
             
             if elapsed >= TIME_TO_LOCK_ROI:
@@ -640,7 +674,9 @@ class DrumApp:
                     print(f"State Changed: CONFIG. ROI: {self.roi}")
         else:
             self.waiting_timer_start = None
-            cv2.putText(display, "Show 5 Fingers to Start", (10, 70), 
+            if DEBUG_MODE: y_text = 90 
+            else: y_text = 60
+            cv2.putText(display, "Show 5 Fingers to Start", (10, y_text), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
 
     def _handle_config(self, frame, display, stick_positions, override_fingers=0):
@@ -757,28 +793,41 @@ class DrumApp:
                     self._trigger_action_cooldown() 
                     self._reset_finger_states()     
 
-    def _handle_playing(self, frame, display, fingers_global, stick_positions):
+    def _handle_playing(self, frame, display, fingers_global, stick_positions, contour, hull, defects):
+        # Draw the hand debug visuals (Contours, Defects)
+        self._draw_hand_debug(display, contour, hull, defects)
+
         # 1. Reset Check (Global 5 fingers)
         if time.time() - self.last_state_change_time > STATE_COOLDOWN_TIME:
             if fingers_global == 5:
-                if not DEBUG_MODE:
-                    _, c_global, _, _, _ = self.hand_detector.process(frame)
-                    if c_global is not None:
-                        x, y, w, h = cv2.boundingRect(c_global)
-                        x = max(0, x - self.roi_padding)
-                        y = max(0, y - self.roi_padding)
-                        w = min(frame.shape[1] - x, w + 2*self.roi_padding)
-                        h = min(frame.shape[0] - y, h + 2*self.roi_padding)
-                        self.roi = (x, y, w, h)
-                elif self.roi is None:
-                     h, w = frame.shape[:2]
-                     self.roi = (int(w*0.25), int(h*0.25), int(w*0.5), int(h*0.5))
+                if self.waiting_timer_start is None:
+                        self.waiting_timer_start = time.time()
 
-                self.instruments.clear()
-                self._change_state(STATE_CONFIG)
-                print("Reset triggered. Back to CONFIG.")
-                return
+                elapsed = time.time() - self.waiting_timer_start
+                cv2.putText(display, f"Hold to End Playing: {elapsed:.1f}/{TIME_TO_LOCK_ROI}s", (10, 70), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                if elapsed >= TIME_TO_LOCK_ROI:
+                    if not DEBUG_MODE:
+                        _, c_global, _, _, _ = self.hand_detector.process(frame)
+                        if c_global is not None:
+                            x, y, w, h = cv2.boundingRect(c_global)
+                            x = max(0, x - self.roi_padding)
+                            y = max(0, y - self.roi_padding)
+                            w = min(frame.shape[1] - x, w + 2*self.roi_padding)
+                            h = min(frame.shape[0] - y, h + 2*self.roi_padding)
+                            self.roi = (x, y, w, h)
+                    elif self.roi is None:
+                         h, w = frame.shape[:2]
+                         self.roi = (int(w*0.25), int(h*0.25), int(w*0.5), int(h*0.5))
 
+                    self.instruments.clear()
+                    self._change_state(STATE_CONFIG)
+                    print("Reset triggered. Back to CONFIG.")
+                    return
+            else:
+                self.waiting_timer_start = None
+                cv2.putText(display, "Show 5 Fingers to Stop Playing", (10, 70), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
         # 2. Track Stick Collisions (Multi-stick)
         self.instruments.check_collisions(stick_positions)
 
